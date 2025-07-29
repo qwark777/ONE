@@ -18,7 +18,7 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 604800
 MYSQL_HOST = "localhost"
 MYSQL_USER = "root"
 MYSQL_PASSWORD = "12345678"
-MYSQL_DB = "one"
+MYSQL_DB = "grade_book"
 MYSQL_PORT = 3306
 
 PROFILE_PHOTOS_DIR = "profile_photos"
@@ -555,6 +555,76 @@ async def get_student_scores_by_subject(
 
     finally:
         conn.close()
+
+
+@app.get("/student-scores-full", response_model=list[dict])
+async def get_all_student_scores(current_user: UserInDB = Depends(get_current_user)):
+    """
+    Возвращает список учеников с их оценками по всем предметам.
+    Формат:
+    [
+        {
+            "student_id": int,
+            "student_name": str,
+            "grades": [
+                {
+                    "subject": str,
+                    "value": int,
+                    "date": str
+                },
+                ...
+            ]
+        },
+        ...
+    ]
+    """
+    conn = await get_db_connection()
+    try:
+        async with conn.cursor() as cursor:
+            await cursor.execute("""
+                SELECT 
+                    u.id AS student_id,
+                    p.full_name AS student_name,
+                    s.name AS subject,
+                    g.value,
+                    g.date
+                FROM users u
+                JOIN profiles p ON u.id = p.user_id
+                JOIN grades g ON u.id = g.student_id
+                JOIN subjects s ON s.id = g.subject_id
+                WHERE u.role = 'student'
+                ORDER BY u.id, g.date
+            """)
+            rows = await cursor.fetchall()
+
+            result = []
+            current_student = None
+            last_id = None
+
+            for row in rows:
+                if row['student_id'] != last_id:
+                    if current_student:
+                        result.append(current_student)
+                    current_student = {
+                        "student_id": row['student_id'],
+                        "student_name": row['student_name'],
+                        "grades": []
+                    }
+                    last_id = row['student_id']
+
+                current_student["grades"].append({
+                    "subject": row["subject"],
+                    "value": row["value"],
+                    "date": row["date"].isoformat() if hasattr(row["date"], "isoformat") else str(row["date"])
+                })
+
+            if current_student:
+                result.append(current_student)
+
+            return result
+    finally:
+        conn.close()
+
 
 
 # ================== Запуск ==================
