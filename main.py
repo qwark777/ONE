@@ -1,9 +1,11 @@
 import os
 from contextlib import asynccontextmanager
 from datetime import UTC
-from typing import Optional
+from enum import Enum
+from typing import Optional, List
 
 import aiomysql
+from cryptography.fernet import Fernet
 from fastapi import FastAPI, HTTPException, Depends, status, UploadFile, File, Form
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from passlib.context import CryptContext
@@ -14,6 +16,18 @@ from starlette.staticfiles import StaticFiles
 SECRET_KEY = "304f1388f317fe2e917a1df468144def7f60586ba96dc80b07d26c68cae00fab"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 604800
+
+
+
+ENCRYPTION_KEY = "ICkoftk-wbOx89vzo2nuGkPatHZCQ1IKBVpFdRJ1F4k="  # Храни в .env
+fernet = Fernet(ENCRYPTION_KEY.encode())
+
+def encrypt_message(message: str) -> str:
+    return fernet.encrypt(message.encode()).decode()
+
+def decrypt_message(encrypted_message: str) -> str:
+    return fernet.decrypt(encrypted_message.encode()).decode()
+
 
 MYSQL_HOST = "localhost"
 MYSQL_USER = "root"
@@ -79,6 +93,42 @@ class ProfileUpdateRequest(BaseModel):
     work_place: str
     location: str
     bio: str
+
+
+class StudentResponse(BaseModel):
+    id: int  # Измените id на user_id
+    full_name: str
+    work_place: Optional[str] = None  # Соответствует полю в БД
+    location: Optional[str] = None
+    bio: Optional[str] = None
+    photo_url: Optional[str] = None
+
+class StudentWithGradesResponse(StudentResponse):
+    grades: List[dict] = []
+    average_score: Optional[float] = None
+
+
+class UserRole(str, Enum):
+    student = "student"
+    teacher = "teacher"
+
+
+
+from pydantic import BaseModel
+from typing import Optional
+
+class UserResponse(BaseModel):
+    id: int
+    full_name: str
+    class_name: Optional[str] = None  # для студентов
+    photo_url: Optional[str] = None
+
+    work_place: Optional[str] = None  # для учителей
+    location: Optional[str] = None
+    subject: Optional[str] = None
+    classes: Optional[str] = None
+    username: Optional[str] = None
+    password: Optional[str] = None
 
 # ================== JWT ==================
 
@@ -253,6 +303,32 @@ async def init_db():
                     FOREIGN KEY (teacher_id) REFERENCES users(id)
                 )
             ''')
+            await cursor.execute('''
+                CREATE TABLE IF NOT EXISTS conversations (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    user1_id INT NOT NULL,
+                    user2_id INT NOT NULL,
+                    user_min_id INT NOT NULL,
+                    user_max_id INT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE KEY unique_pair (user_min_id, user_max_id),
+                    FOREIGN KEY (user1_id) REFERENCES users(id),
+                    FOREIGN KEY (user2_id) REFERENCES users(id)
+                )
+            ''')
+            await cursor.execute('''
+                CREATE TABLE IF NOT EXISTS messages (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    conversation_id INT NOT NULL,
+                    sender_id INT NOT NULL,
+                    content TEXT NOT NULL, 
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (conversation_id) REFERENCES conversations(id),
+                    FOREIGN KEY (sender_id) REFERENCES users(id)
+                )
+            ''')
+
+
             await conn.commit()
     finally:
         conn.close()
@@ -370,7 +446,7 @@ from fastapi.responses import FileResponse
 @app.get("/profile/photo")
 async def get_profile_photo(current_user: UserInDB = Depends(get_current_user)):
     for ext in ["jpg", "jpeg", "png"]:
-        file_name = f"{current_user.username}.{ext}"
+        file_name = f"{current_user.id}.{ext}"
         file_path = os.path.join(PROFILE_PHOTOS_DIR, file_name)
         if os.path.exists(file_path):
             media_type = f"image/{'jpeg' if ext in ['jpg', 'jpeg'] else 'png'}"
@@ -388,7 +464,8 @@ async def verify_token_endpoint(
         "username": current_user.username,
         "role": getattr(current_user, "role", "student"),
         "access_token": new_token,
-        "token_type": "bearer"
+        "token_type": "bearer",
+        "user_id": current_user.id
     }
 
 
@@ -398,7 +475,15 @@ async def get_profile_data(current_user: UserInDB = Depends(get_current_user)):
     conn = await get_db_connection()
     try:
         async with conn.cursor() as cursor:
-            await cursor.execute("SELECT full_name, work_place, location, bio FROM profiles WHERE user_id = %s", (current_user.username,))
+            await cursor.execute("""
+                            SELECT 
+                                TRIM(BOTH '"' FROM full_name) AS full_name,
+                                TRIM(BOTH '"' FROM work_place) AS work_place,
+                                TRIM(BOTH '"' FROM location) AS location,
+                                TRIM(BOTH '"' FROM bio) AS bio
+                            FROM profiles 
+                            WHERE user_id = %s
+                        """, (current_user.id,))
             profile = await cursor.fetchone()
 
             if profile:
@@ -422,15 +507,15 @@ async def update_full_profile(
     conn = await get_db_connection()
     try:
         async with conn.cursor() as cursor:
-            await cursor.execute("SELECT * FROM profiles WHERE user_id = %s", (current_user.username,))
-            exists = await cursor.fetchone()
 
+            await cursor.execute("SELECT * FROM profiles WHERE user_id = %s", (current_user.id,))
+            exists = await cursor.fetchone()
             if exists:
                 await cursor.execute("""
                     UPDATE profiles
                     SET full_name = %s, work_place = %s, location = %s, bio = %s
                     WHERE user_id = %s
-                """, (full_name, work_place, location, bio, current_user.username))
+                """, (full_name, work_place, location, bio, current_user.id))
             else:
                 await cursor.execute("""
                     INSERT INTO profiles (user_id, full_name, work_place, location, bio)
@@ -447,11 +532,11 @@ async def update_full_profile(
 
             # Удалим старые
             for e in ["jpg", "jpeg", "png"]:
-                old_path = os.path.join(PROFILE_PHOTOS_DIR, f"{current_user.username}.{e}")
+                old_path = os.path.join(PROFILE_PHOTOS_DIR, f"{current_user.id}.{e}")
                 if os.path.exists(old_path):
                     os.remove(old_path)
 
-            path = os.path.join(PROFILE_PHOTOS_DIR, f"{current_user.username}.{ext}")
+            path = os.path.join(PROFILE_PHOTOS_DIR, f"{current_user.id}.{ext}")
             with open(path, "wb") as f:
                 f.write(await file.read())
 
@@ -622,6 +707,204 @@ async def get_all_student_scores(current_user: UserInDB = Depends(get_current_us
                 result.append(current_student)
 
             return result
+    finally:
+        conn.close()
+
+@app.get("/users/all", response_model=List[UserResponse])
+async def get_all_users(
+    role: UserRole,
+    page: int = 1,
+    per_page: int = 20,
+    current_user: UserInDB = Depends(get_current_user)
+):
+    """
+    Получить всех пользователей по роли (ученики или преподаватели)
+    """
+    conn = await get_db_connection()
+    try:
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
+            offset = (page - 1) * per_page
+
+            if role == UserRole.student:
+                await cursor.execute("""
+                    SELECT 
+                        u.id,
+                        p.full_name,
+                        (SELECT c.name FROM classes c 
+                         JOIN class_students cs ON c.id = cs.class_id 
+                         WHERE cs.student_id = u.id LIMIT 1) as class_name,
+                        p.photo_url
+                    FROM users u
+                    JOIN profiles p ON u.id = p.user_id
+                    WHERE u.role = 'student'
+                    LIMIT %s OFFSET %s
+                """, (per_page, offset))
+
+            elif role == UserRole.teacher:
+                await cursor.execute("""
+                    SELECT 
+                        u.id,
+                        p.full_name,
+                        p.work_place,
+                        p.location,
+                        (SELECT GROUP_CONCAT(c.name SEPARATOR ', ') 
+                         FROM class_teachers ct 
+                         JOIN classes c ON ct.class_id = c.id 
+                         WHERE ct.teacher_id = u.id) as classes,
+                        p.photo_url
+                    FROM users u
+                    JOIN profiles p ON u.id = p.user_id
+                    WHERE u.role = 'teacher'
+                    LIMIT %s OFFSET %s
+                """, (per_page, offset))
+
+            users = await cursor.fetchall()
+            return users
+
+    finally:
+        conn.close()
+
+
+
+class MessageIn(BaseModel):
+    receiver_id: int
+    content: str
+
+class SendMessageRequest(BaseModel):
+    receiver_id: int
+    content: str
+
+@app.post("/messages/send")
+async def send_message(
+    data: SendMessageRequest,
+    current_user: UserInDB = Depends(get_current_user)
+):
+    conn = await get_db_connection()
+    try:
+        async with conn.cursor() as cursor:
+            user1_id = current_user.id
+            user2_id = data.receiver_id
+            user_min_id = min(user1_id, user2_id)
+            user_max_id = max(user1_id, user2_id)
+
+            # 1. Поиск существующей беседы
+            await cursor.execute("""
+                SELECT id FROM conversations
+                WHERE user_min_id = %s AND user_max_id = %s
+            """, (user_min_id, user_max_id))
+            conv = await cursor.fetchone()
+
+            # 2. Если беседы нет — создать
+            if not conv:
+                await cursor.execute("""
+                    INSERT INTO conversations (user1_id, user2_id, user_min_id, user_max_id)
+                    VALUES (%s, %s, %s, %s)
+                """, (user1_id, user2_id, user_min_id, user_max_id))
+                await conn.commit()
+                conversation_id = cursor.lastrowid
+            else:
+                conversation_id = conv["id"]
+
+            # 3. Зашифровать сообщение
+            encrypted = encrypt_message(data.content)
+
+            # 4. Сохранить сообщение
+            await cursor.execute("""
+                INSERT INTO messages (conversation_id, sender_id, content)
+                VALUES (%s, %s, %s)
+            """, (conversation_id, current_user.id, encrypted))
+            await conn.commit()
+
+            return {"status": "ok", "conversation_id": conversation_id}
+
+    finally:
+        conn.close()
+
+
+
+@app.get("/messages/{user_id}")
+async def get_messages(user_id: int, current_user: UserInDB = Depends(get_current_user)):
+    conn = await get_db_connection()
+    try:
+        user_min_id = min(current_user.id, user_id)
+        user_max_id = max(current_user.id, user_id)
+
+        async with conn.cursor() as cursor:
+            # найти conversation
+            await cursor.execute("""
+                SELECT id FROM conversations
+                WHERE user_min_id = %s AND user_max_id = %s
+            """, (user_min_id, user_max_id))
+            conv = await cursor.fetchone()
+            if not conv:
+                return []
+
+            conversation_id = conv["id"]
+
+            # получить сообщения
+            await cursor.execute("""
+                SELECT sender_id, content, created_at
+                FROM messages
+                WHERE conversation_id = %s
+                ORDER BY created_at
+            """, (conversation_id,))
+
+            rows = await cursor.fetchall()
+
+            # расшифровать каждое сообщение
+            messages = []
+            for row in rows:
+                try:
+                    decrypted = decrypt_message(row["content"])
+                except Exception as e:
+                    decrypted = "[не удалось расшифровать]"
+                messages.append({
+                    "sender_id": row["sender_id"],
+                    "content": decrypted,
+                    "created_at": row["created_at"].isoformat()
+                })
+
+            return messages
+    finally:
+        conn.close()
+
+
+@app.get("/conversations")
+async def get_user_conversations(current_user: UserInDB = Depends(get_current_user)):
+    conn = await get_db_connection()
+    try:
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
+            await cursor.execute("""
+                SELECT c.id AS conversation_id,
+                       u.id AS user_id,
+                       p.full_name,
+                       p.photo_url,
+                       m.content,
+                       m.created_at,
+                       m.sender_id
+                FROM conversations c
+                JOIN users u ON u.id = IF(c.user1_id = %s, c.user2_id, c.user1_id)
+                JOIN profiles p ON p.user_id = u.id
+                LEFT JOIN (
+                    SELECT conversation_id, MAX(created_at) AS max_time
+                    FROM messages
+                    GROUP BY conversation_id
+                ) latest ON latest.conversation_id = c.id
+                LEFT JOIN messages m ON m.conversation_id = c.id AND m.created_at = latest.max_time
+                WHERE %s IN (c.user1_id, c.user2_id)
+                ORDER BY m.created_at DESC
+            """, (current_user.id, current_user.id))
+
+            rows = await cursor.fetchall()
+            return [{
+                "conversation_id": row["conversation_id"],
+                "user_id": row["user_id"],
+                "full_name": row["full_name"],
+                "photo_url": row["photo_url"],
+                "last_message": row["content"],
+                "last_time": row["created_at"],
+                "last_sender_id": row["sender_id"]
+            } for row in rows if row["content"]]
     finally:
         conn.close()
 
